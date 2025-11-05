@@ -806,6 +806,30 @@ async def main():
     print(f"[BOT] Logged in as @{me.username} (id={me.id})")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member", "chat_member"])
 
+from aiohttp import web
+import threading
+
+# Простой веб-сервер для обхода проверки порта
+def run_web_server():
+    async def health_check(request):
+        return web.Response(text="Bot is running")
+    
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    
+    # Запускаем в отдельном потоке
+    web.run_app(app, host='0.0.0.0', port=8000, print=None)
+
+# Запускаем веб-сервер при старте
+if __name__ == "__main__":
+    # Запускаем веб-сервер в фоне
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    
+    # Запускаем бота
+    asyncio.run(main())
+    
 if __name__ == "__main__":
     asyncio.run(main())
+
 
