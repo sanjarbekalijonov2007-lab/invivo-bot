@@ -1,0 +1,810 @@
+# bot.py
+import asyncio, os, html
+from typing import Dict, Any, List, Tuple
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+)
+from dotenv import load_dotenv
+import requests
+
+# === ENV ===
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5867627773"))
+REG_PHONE = os.getenv("REG_PHONE", "+998 99 302 32 31")
+REG_USERNAME = os.getenv("REG_USERNAME", "invivo_registratura")  # без @
+
+# === BOT/DP ===
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi .env faylda")
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+user_history = {}
+
+# === LLM ===
+# === LLM UNIVERSAL FUNKSIYA (Gemini + OpenAI) ===
+# === LLM UNIVERSAL FUNKSIYA (Gemini + OpenAI) ===
+def ask_llm(user_text: str, user_id: int) -> str:
+    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+
+    # 🏥 Klinik ma’lumotlar
+    clinic_info = (
+        "Sen Invivo Clinic klinikasi administratori sifatida javob berasan. "
+        "Har doim foydalanuvchiga muloyim, qisqa va o‘zbek tilida (lotin yozuvida) javob ber. "
+        "Klinikamizda quyidagi yo‘nalishlar mavjud: Terapiya, Pediatriya, Nevrologiya, Ginekologiya, "
+        "Stomatologiya, UZI, Fizioterapiya, Zuluk terapiyasi, Hijoma va Inseminatsiya. "
+        "Manzil: Farg'ona viloyati, Rishton tumani, Farovonlik MFY, To'qimachilar ko'chasi 55A. "
+        "Telefon: +998 99 302 32 31.\n\n"
+        "Quyidagi shifokorlar ishlaydi:\n"
+        "- Urinov Xurshid — Endokrinolog\n"
+        "- Yefirova Rumiyaxon — Ginekolog\n"
+        "- Madaminova Fotimaxon — UZI mutaxassisi\n"
+        "- Foziljonov Raxmatjon — Nevropatolog\n"
+        "- Dadaboyev Azizjon — Gastroenterolog\n"
+        "- Urinova Irodaxon — Okulist\n"
+        "Agar foydalanuvchi narxlar yoki analizlar haqida so‘rasa, shunga mos javob ber. "
+        "Agar u shaxsiy sog‘lig‘i haqida so‘rasa, umumiy maslahat ber va shifokorga murojaat qilishni tavsiya et."
+    )
+
+    # 🧠 User tarixini saqlaymiz
+    if user_id not in user_history:
+        user_history[user_id] = [{"role": "system", "content": clinic_info}]
+    user_history[user_id].append({"role": "user", "content": user_text})
+
+    # --- GEMINI ---
+    if provider == "gemini":
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+            model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+
+            # Tarixni matnga birlashtiramiz
+            conversation = "\n".join(
+                [f"{msg['role']}: {msg['content']}" for msg in user_history[user_id][-6:]]
+            )
+            response = model.generate_content(conversation)
+            reply = response.text.strip()
+            user_history[user_id].append({"role": "assistant", "content": reply})
+            return reply
+        except Exception as e:
+            print("[Gemini error]", e)
+
+    # --- OPENAI ---
+    try:
+        import requests
+        api_key = os.getenv("OPENAI_API_KEY")
+        payload = {
+            "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "messages": user_history[user_id][-8:],  # so‘nggi 8 xabarni yuboramiz
+            "temperature": 0.3,
+        }
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=30
+        )
+        msg = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        user_history[user_id].append({"role": "assistant", "content": msg})
+        return msg.strip() or "Savolingizga javob tayyorlanyapti..."
+    except Exception as e:
+        print("[OpenAI error]", e)
+        return "Uzr, javob olishda xatolik yuz berdi."
+
+# === DATA ===
+CLINIC = {
+    "name": "Invivo Clinic",
+    "photo": "https://i.postimg.cc/nrtxszBR/9ea78d43.jpg",
+    "hours": "Dushanba–Shanba 09:00–18:00, Yakshanba — dam olish kuni",
+    "address": ("Farg'ona viloyati, Rishton tumani, Farovonlik MFY, "
+                "To'qimachilar ko'chasi 55A uy (Tuman prokuraturasi orqasida)."),
+    "prices": {"consultation": 60000, "analysis": 80000, "ultrasound": 120000},
+}
+
+# === PRICES DATA (LAB + UZI + OTHER) ===
+LAB_PRICES: Dict[str, List[Tuple[str, int]]] = {
+    "Siydik tahlillari": [
+        ("Umumiy siydik tahlili", 35000),
+        ("Siydik bo'yicha Nechiporenko", 40000),
+        ("Siydik bo'yicha Zimnitskiy", 40000),
+        ("Siydikda o't pigmentlari", 10000),
+        ("Siydikda atseton", 10000),
+        ("Siydikdagi mikroalbumin", 0000),
+        ("Oqsil siydikda", 5000),
+        ("Glyukoza siydikda", 5000),
+    ],
+#siydik taxlili tugirlandi
+    "Najas tahlillari": [
+        ("Najasda gelment tuxumladri", 20000),
+        ("Najasda oddiy gelmintlar (lyambiyalar)", 40000),
+        ("Umumiy najas tahlili (koprogramma)", 20000),
+        ("Yashirin qon najasda", 20000),
+        ("Enterobioz (qurt) uchun so`skob (ostritsa)", 20000),
+    ],
+#najas taxlili buldi
+   "Biokimyo": [
+        ("Glyukoza tolerantlik testi", 35000),
+        ("Ovqatdan 2 soat o‘tib glyukoza", 40000),
+        ("Laktat (sut kislotasi)", None),
+        ("Insulin", 100000),
+        ("Glikolizlangan gemoglobin", 70000),
+        ("HOMA indeksi (insulin + glyukoza och qoringa)", None),
+        ("Fruktozamin", None),
+
+       #("JIGAR TESTLARI"),
+        ("Umumiy bilirubin", 40000),
+        ("To‘g‘ridan-to‘g‘ri bilirubin", 20000),
+        ("Boshqa bilirubin (bilvosita)", 20000),
+        ("ALT (alanin transaminaza)", 20000),
+        ("AST (aspartat transaminaza)", 20000),
+        ("Timol testi", None),
+        ("Umumiy oqsil", 20000),
+        ("Albumin", 25000),
+        ("GGT (gamma-glutamil transferaza)", 20000),
+        ("Lipid spektori", 90000),
+        ("Safro kislotalari", None),
+        ("Umumiy xolesterin", 30000),
+        ("Yuqori zichlikdagi xolesterin (HDL)", 30000),
+        ("Past zichlikdagi xolesterin (LDL)", 30000),
+        ("Triglitseridlar", 30000),
+        ("Aterogenlik indeksi", 40000),
+        ("Apolipoprotein A1", None),
+        ("Apolipoprotein B", None),
+       #("ANEMIYA DIAGNOSTIKASI"),
+        ("Temir (Fe)", 20000),
+        ("Ferritin", 80000),
+        ("Transferin", None),
+        ("Eritropoetin", None),
+       #("FERMENTLAR"),
+        ("Alfa-amilaza (qon)", 25000),
+        ("Alfa-amilaza (siydik)", None),
+        ("Lipaza", None),
+        ("Shilox fosfataza (ALP)", 20000),
+        ("Gamma-glyutamiltransferaza (GGT)", 20000),
+        ("Kislotali fosfataza (ACP)", None),
+        ("LDG (Laktatdegidrogenaza)", None),
+        ("Xolinesteraza", None),
+        ("Kreatinkinaza (KFK)", 50000),
+        ("KFK-MB fraksiyasi", None),
+        ("Sistatin C", None),
+        ("GAD antitanasi", None),
+        ("Elastaza", None),
+        ("Kalprotektin", None),
+       #("BUYRAK testlari"),
+        ("Mochevina", 25000),
+        ("Kreatinin", 25000),
+        ("Reberg testi (filtratsiya funksiyasi)", None),
+        ("Siydik kislotasi (qon)", 25000),
+        ("Siydik kislotasi (sutkalik siydik)", None),
+       #("Mineral almashinuvi"),
+        ("Kaliy (K)", 20000),
+        ("Natriy (Na)", 20000),
+        ("Temir (Fe)", 20000),
+        ("Magniy (Mg)", 20000),
+        ("Kaltsiy (qon)", 20000),
+        ("Kaltsiy (siydik)", None),
+        ("Fosfor (P)", None),
+        ("Rux (Zn)", 20000),
+        ("Mis (Cu)", None),
+       #("Vitaminlar"),
+        ("Vitamin D", 160000),
+        ("Folat (Vitamin B9)", None),
+        ("Gomosistein", None),
+     ],
+"Gormonlar (IHLA)": [
+    ("TTG", "80 000"),
+    ("T3 (umumiy)", None),
+    ("T3 erkin", "80 000"),
+    ("T4 (umumiy)", None),
+    ("T4 erkin", "80 000"),
+    ("Anti-TG (tireoglobulinga antitanacha)", None),
+    ("Anti-TPO", "80 000"),
+    ("Tireoglobulin", "80 000"),
+    ("Anti-rTTG (TSH retseptoriga antitanacha)", None),
+    ("Progesteron", None),
+    ("Estradiol", "80 000"),
+    ("Estriol (erkin)", None),
+    ("Prolaktin", "80 000"),
+    ("Testosteron", 85000),
+    ("Testosteron erkin", None),
+    ("FSH", 80000),
+    ("LH", 80000),
+    ("DHEAS", "100 000"),
+    ("17-OH Progesteron", "90 000"),
+    ("AMH (Anti-Muller gormoni)", "300 000"),
+    ("SHBG (jinsiy gormon bog‘lovchi globulin)", None),
+    ("Inhibin-B", None),
+    ("Natriy ureticheskiy peptid", 180000),
+    #Buyrakusti va Gipofiz gormonlari
+    ("Kortizol (ertalab)", "80 000"),
+    ("Kortizol (kechqurun)", "80 000"),
+    ("STG (somatotrop gormon)", "80 000"),
+    ("IGF-1", None),
+    ("IGFBP-3", None),
+    ("AKTG", None),
+    ("Aldosteron", None),
+    ("Renin", None),
+    ("Adrenalin/Noradrenalin", None),
+    ("PTH (paratgormon)", None),
+    ("Insulin", 100000),
+    ("C-peptid", 90000),
+    ("Umumiy IgE (allergiya)", 80000),
+    ("XGCh (homiladorlik erta diagnostikasi)", None),
+],
+"Qon tahlillari": [
+    ("Umumiy qon tahlili (21 ko‘rsatkich)", 45000),
+    ("SOE — eritrotsit cho‘kish tezligi", 10000),
+    ("Umumiy qon tahlili (gemoglobin, leykotsit SOE", 25000),
+    ("Gemoglobin konsentratsiyasi(Hb)", 10000),
+#то что исправил сверху
+    ("Leykotsitlar soni (WBC)", None),
+    ("Eritrotsitlar soni (RBC)", None),
+    ("Trombositlar soni (PLT)", None),
+    ("Gemotokrit (HCT)", None),
+    ("Limfotsitlar (%)", None),
+    ("Monotsitlar (%)", None),
+    ("Eozinofillar (%)", None),
+    ("Bazofillar (%)", None),
+    ("Neytrofillar (%)", None),
+    ("Rang indeksi", None),
+    ("Retikulotsitlar", None),
+    ("Eritrotsitlar shakli (poikilositoz)", None),
+    ("Trombotsitlar hajmi (MPV)", None),
+    ("RDW (eritrotsit hajmining o‘zgaruvchanligi)", None),
+    ("PDW (trombotsit hajm o‘zgaruvchanligi)", None),
+    ("PLCR — katta trombotsitlar nisbati", None),
+    ("PCT — trombotsitli gematokrit", None),
+    ("SOE (Westergren usuli)", None),
+    ("Gemogramma kengaytirilgan (36 parametr)", None),
+    ("Qon guruhi (AB0)", None),
+    ("Rezusrivo (Rh)", None),
+    ("Qon guruhi + rezus faktori", None),
+    ("Koagulogramma (IV daraja)", None),
+    ("Protrombin va MNO (INR)", None),
+    ("Fibrinogen", 40000),
+    ("D-dimer", None),
+    ("Antitrombin III", None),
+    ("Protein S", None),
+    ("Protein C", None),
+    ("Homokistein (qon)", None),
+    ("Fermentlar faolligi (LDH, AST, ALT)", None),
+    ("Temir (Fe)", None),
+    ("Ferritin", 20000),
+    ("Vitamin B12", None),
+    ("Folat (Vitamin B9)", None),
+    ("Vitamin D", 160000),
+],
+    "MSKT": [
+        ("Bosh miya MSKT", 250000), ("Bo'yin MSKT", 220000),
+        ("Ko'krak qafasi MSKT", 250000), ("Qorin bo'shlig'i MSKT", 260000),
+    ],
+    "Stomatologiya": [
+        ("Konsultatsiya", 60000), ("Plomba (ishga qarab)", 250000),
+        ("Tish olib tashlash", 200000), ("Professional tozalash (skaling)", 180000),
+    ],
+    "Ginekologiya": [
+        ("Konsultatsiya", 80000),  
+        ("PAP-test (surtma)", 80000),
+    ],
+    "UZI": [
+        ("Qorin bo'shlig'i UZI", 100000), ("Yurak EKO (ECHO)", 90000),
+        ("Konsultatsiya", 70000),
+        ("Homiladorlik skrini", 80000), ("Ichki UZI", 70000), ("Qon tomirlar doplerografiyasi", 120000), ("Bachadon va yakka azolar", 70000),
+        ("Dolper", 100000), ("Ko'krak bezi UZI", 70000), ("Buyraklar UZI", 70000),
+        ("Follekulametriya", 60000), ("Qalqonsimon bez UZI", 70000),
+    ],
+    "Endoskopiya (FGDS/Kolonoskopiya)": [
+        ("FGDS (oshqozon-o'n ikki barmoq ichak)", 350000),
+        ("Kolonoskopiya", 500000), ("Sedatsiya (ixtiyoriy)", 200000),
+    ],
+    "Fizioterapiya": [("Bir seans (magnit/ultratovush/elektro)", 50000), ("5 seans kursi", 225000)],
+    "Zuluk terapiyasi": [("Bir seans (2-4 zuluk)", 120000)],
+    "Hijoma": [("Bir seans", 150000)],
+    "Inseminatsiya": [("Inseminatsiya", 1500000)],
+}
+
+# === DOCTORS ===
+DOCTORS = [
+    {"id": "urinov", "name": "Endokrinolog \n: Urinov Xurshid",
+     "photo": "https://i.postimg.cc/QNBh0204/c8012de3.jpg",
+     "experience": "10 лет", "schedule": "Dushanba-Juma 8:00 dan 18:00 gacha",
+     "skills": ["✅ Reproduktolog","✅ Terapiya","✅ Profilaktika","✅ Konsultatsiya"]},
+    {"id": "azizjon", "name": "Gastrentolog-Onkolog, ФГДС-mutaxasisi \n: Dadaboyev Azizjon",
+     "photo": "https://i.postimg.cc/8cVmsnj8/66ee921c.jpg",
+     "experience": "10 лет", "schedule": "Payshanba va Shanba kunlari 14:00 dan 17:00 gacha",
+     "skills": ["✅ Analiz","✅ Profilaktika","✅ Konsultatsiya"]},
+    {"id": "madaminov", "name": "Endokrinolog \n: Madaminov Murodjon",
+     "photo": "https://i.postimg.cc/D02mG0dZ/4ab4f621.jpg",
+     "experience": "2 лет", "schedule": "Dushanba-Shanba: 8:00 dan 18:00 gacha",
+     "skills": ["✅ Terapiya","✅ Profilaktika","✅ Konsultatsiya"]},
+    {"id": "soxibjon", "name": "Nevropotolog-gastrentolog, ФГДС-mutaxasisi \n: Muxamadaliyev Soxibjon",
+     "photo": "https://i.postimg.cc/kgMwxZsp/1f12dbab.jpg",
+     "experience": "10 лет", "schedule": "Dushanba-Shanba 14:00 dan 17:00 gacha",
+     "skills": ["✅ Analiz","✅ Profilaktika","✅ Konsultatsiya"]},
+    {"id": "urinova", "name": " Okulist \n: Urinova Irodaxon",
+     "photo": "https://i.postimg.cc/L6Cby8wf/20357709.jpg",
+     "experience": "8 лет", "schedule": "Dushanba/Shanba: 8:00-13:00",
+     "skills": ["✅ Pediatriya","✅ Konsultatsiya","✅ Profilaktika"]},
+    {"id": "foziljonov", "name": " Nevropatolog \n: Foziljonov Raxmatjon Xikmatjon o'g'li",
+     "photo": "https://i.postimg.cc/QMWFLFbX/72e631e7.jpg",
+     "experience": "15 лет", "schedule": "Yakshanba: 09:00-14:00",
+     "skills": [
+            "✅ Bosh miyyada qon aylanishi buzulishi (insult)","✅ Bel disk grijalari","✅ Boshdagi og'riq","✅ Batuloterapiya va Kosoartrozlarda gialuron kislatasini inyeksiyasi",
+            "✅ Quloqlardagi sho'vqin","✅ Turli eplepsiya kasalliklari","✅ Nerf shamaloshi (nevralgiya)",
+            "✅ Kuchli depresiya","✅ Asabiylik","✅ Boshdagi bosimni oshishi",
+            "✅ Nerf impulslari bilan bog'liq muammolar","✅ Uyqusizlik","✅ Tanadagi ko'chib yuruvchi og'riqlar"
+        ]},
+    {"id": "rumiya", "name": "Genekolog\n: Yefirova Rumiyaxon",
+     "photo": "https://i.postimg.cc/TwRCNvVm/07d9faf5.jpg",
+     "experience": "20 yil", "schedule": "Dushanba/Shanba: 8:00-15:00",
+     "skills": ["✅ Akusher-ginekolog","✅ Homiladorlikni kuzatish","✅ Ayollar sog'lig'i bo'yicha maslahatlar",
+            "✅ Gormonal muvozanat buzilishi","✅ Reproduktiv salomatlik"]},
+    {"id": "tashkentbayev", "name": "Stamotolog \n: Tashkenbayev Shoyatbek",
+     "photo": "https://example.com/ahmedov.jpg",
+     "experience": "20 лет", "schedule": "Sb-Vs: 11:00-17:00",
+     "skills": ["✅ Качественные пломбы","✅ Импланты","✅ Бреккеты"]},
+    {"id": "fotimaxon", "name": "UZI mutaxasis \n: Madaminova Fotimaxon ",
+     "photo": "https://i.postimg.cc/VvBBtBC0/cd1ddd72.jpg",
+     "experience": "10 лет", "schedule": "Pn-Sr-Pt: 08:30-15:00",
+     "skills": ["✅ ЭХО-КГ ","✅ Барча кон томирлар доплероорафияси","✅ Корин бушлиги азолари ультратовуш текшируви","✅ Фолликулометрия ички ва ташки датчиклар ассосида","✅ Хомиладорликдаги скрининг ва нухсонли холатларни аниклаш"]},
+]
+
+# === UTILS ===
+def esc(t: str) -> str:
+    return html.escape(t or "")
+
+def sums(n) -> str:
+    try:
+        if isinstance(n, str):
+            n = n.replace(" ", "").replace(",", "").replace("\u00a0", "")
+        val = int(float(n))
+    except Exception:
+        return str(n)
+    return f"{val:,}".replace(",", " ") + " so'm"
+
+# === REPLY KEYBOARD ===
+def main_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="👨‍⚕️ Mutaxassislar")],
+        [KeyboardButton(text="🧪 Laboratoriya analizlari"), KeyboardButton(text="🖥️ UZI")],
+        [KeyboardButton(text="🕘 Ish vaqti"), KeyboardButton(text="📍 Manzil")],
+        [KeyboardButton(text="🏥 Klinika haqida"), KeyboardButton(text="ℹ️ Ma'lumot")],
+        [KeyboardButton(text="💵 Narxlar")],
+        [KeyboardButton(text="📝 Navbatga yozilish")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+# === DOCTORS UI ===
+def doctors_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for d in DOCTORS:
+        title = d.get("name", "Shifokor")
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"doc:{d['id']}")])
+    if not rows:
+        rows = [[InlineKeyboardButton(text="(Hozircha ro‘yxat bo‘sh)", callback_data="doc:list")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ro'yxatga qaytish", callback_data="doc:list")]]
+    )
+
+def doctor_caption(d: Dict[str, Any]) -> str:
+    if d.get("id") == "foziljonov":
+        return (
+            "🔰Nevropatolog🔰\n\n"
+            "Yuqori Malalali Shifokor :👨‍⚕️\n"
+            "Nevropatolog 🧠 \n"
+            "Foziljonov Raxmatjon Xikmatjon og'li.\n\n"
+            "✅Bosh miyyada qon aylanishi buzulishi (insult)\n"
+            "✅Bel disk grijalari \n"
+            "✅Boshdagi og'riq\n"
+            "✅Quloqlardagi sho'vqin\n"
+            "✅Turli eplepsiya kasaliklari\n"
+            "✅Nerf shamaloshi (nevralgiya)\n"
+            "✅Kuchli depresiya \n"
+            "✅Asabiylik \n"
+            "✅Boshdagi bosimni oshishi \n"
+            "✅Nerf impulslari bilan bog'liq muamolar\n"
+            "✅Uyqusizlik \n"
+            "✅Tanadagi ko'chib yuruvchi og'riqlar \n\n"
+            "📅Ish vaqti: Yakshanba 09:00-14:00"
+        )
+    ism = d.get("name", "Shifokor")
+    jadval = d.get("schedule", "-")
+    tajriba = d.get("experience", "-")
+    skills = d.get("skills", [])
+    skills_str = "\n".join(skills) if isinstance(skills, list) else str(skills)
+    sarlavha = d.get("title", "Yuqori malakali shifokor")
+    return (
+        f"🔰{sarlavha}🔰\n\n"
+        f"{ism}\n\n"
+        f"{skills_str}\n\n"
+        f"📅 Ish vaqti: {jadval}\n"
+        f"🧭 Tajriba: {tajriba.replace('лет', 'yil')}"
+    )
+
+# === LAB / UZI / PRICES HELPERS ===
+LAB_ALLOWED = ["Qon tahlillari", "Siydik tahlillari", "Najas tahlillari", "Biokimyo", "Gormonlar (IHLA)"]
+
+def lab_groups_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for title in LAB_ALLOWED:
+        if title in LAB_PRICES:
+            rows.append([InlineKeyboardButton(text=title, callback_data=f"labcat:{title}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def lab_category_text(cat_title: str) -> str:
+    items = LAB_PRICES.get(cat_title, [])
+    if not items:
+        return "Kategoriya topilmadi."
+    lines = [f"🧪 <b>{cat_title}</b>", "Quyidagi tahlillar va narxlar:"]
+    for name, price in items:
+        lines.append(f"• {name} — <b>{sums(price)}</b>")
+    return "\n".join(lines)
+
+OTHER_PRICE_CATS = [
+    k for k in LAB_PRICES.keys()
+    if k not in {"Qon tahlillari","Siydik tahlillari","Najas tahlillari","Biokimyo","Gormonlar (IHLA)","UZI"}
+]
+
+def other_prices_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=title, callback_data=f"pricecat:{title}")] for title in OTHER_PRICE_CATS]
+    if not rows:
+        rows = [[InlineKeyboardButton(text="(Hozircha yo‘q)", callback_data="pricecat:none")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def send_price_category_message(m: Message, cat_title: str):
+    if cat_title not in LAB_PRICES:
+        await m.answer("Kategoriya topilmadi.")
+        return
+    lines = [f"📂 <b>{cat_title}</b>", "Quyidagi xizmatlar:"]
+    for name, val in LAB_PRICES[cat_title]:
+        lines.append(f"• {name} — <b>{sums(val)}</b>")
+    await m.answer("\n".join(lines))
+
+# === INSEMIN VIDEO ===
+INSEM_VIDEO = "https://t.me/INVIVO_insem/4"
+def malumot_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Video (ko‘rish)", url=INSEM_VIDEO)]
+    ])
+
+async def show_insemination_info(m: Message):
+    text = (
+        "ℹ️ <b>Inseminatsiya haqida</b>\n\n"
+        "Sun’iy urug‘lantirish (inseminatsiya) — spermani bevosita bachadon bo‘shlig‘iga kiritish orqali "
+        "homiladorlik ehtimolini oshiruvchi usul.\n\n"
+        "<b>Ko‘rsatmalar:</b>\n"
+        "• Er-xotin bepushtligi (erkak faktor / servikal faktor)\n\n"
+        "<b>Afzalliklari:</b>\n"
+        "• Og‘riqsiz va tez\n"
+        "• Qayta tiklanish davri talab qilinmaydi\n\n"
+        "Videoni ko‘rib chiqing va savollaringiz bo‘lsa, yozing."
+    )
+    await m.answer(text, reply_markup=malumot_kb(), disable_web_page_preview=False)
+
+# === BOOKING ===
+def booking_info_text() -> str:
+    at = f"@{REG_USERNAME}" if REG_USERNAME else "—"
+    return (
+        "📝 <b>Navbatga yozilish</b>\n"
+        f"📞 <b>Registatura:</b> <b>{REG_PHONE}</b>\n"
+        f"👤 <b>Telegram:</b> {at}\n\n"
+        "Xozirgi vaqtda botni uzi navbatga ololmaydi, shu sababli registraturaga murojat qiling."
+    )
+
+async def notify_admin_booking(m: Message, source: str):
+    user = m.from_user
+    uname = ("@" + user.username) if user and user.username else "—"
+    full = user.full_name if user else "—"
+    uid = user.id if user else "—"
+    chat_link = f"tg://user?id={uid}" if uid != "—" else "—"
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            (
+                "📥 <b>So‘rov: navbatga yozilish</b>\n"
+                f"🧩 <b>Manba:</b> {source}\n"
+                f"👤 {full} ({uname})\n"
+                f"🆔 <code>{uid}</code>\n"
+                f"🔗 {chat_link}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print("[ADMIN NOTIFY ERROR]", repr(e))
+
+# === COMMON HANDLERS ===
+@dp.message(CommandStart())
+async def start(m: Message):
+    await m.answer(
+        f"<b>{esc(CLINIC['name'])} ga xush kelibsiz!</b>\nQuyidagi bo'limlardan birini tanlang.",
+        reply_markup=main_kb()
+    )
+
+@dp.message(Command("help"))
+async def help_(m: Message):
+    await m.answer(
+        "Quyidagi tugmalardan foydalaning: Mutaxassislar, Ish vaqti, Manzil, Klinika haqida, Narxlar, Navbatga yozilish.",
+        reply_markup=main_kb()
+    )
+
+# ℹ️ Ma'lumot
+@dp.message(
+    (F.text == "ℹ️ Ma'lumot") |
+    (F.text.lower().contains("ma'lumot")) |
+    (F.text.lower().contains("ma’lumot")) |
+    (F.text.lower().contains("malumot")) |
+    (F.text.lower().contains("инсеминац"))
+)
+async def on_malumot(m: Message):
+    await show_insemination_info(m)
+
+# === LAB / UZI / PRICES HANDLERS ===
+@dp.message(F.text == "🧪 Laboratoriya analizlari")
+async def btn_lab(m: Message):
+    await m.answer("🧪 Laboratoriya bo‘limlari:", reply_markup=lab_groups_kb())
+
+@dp.message(F.text == "🖥️ UZI")
+async def btn_uzi(m: Message):
+    await send_price_category_message(m, "UZI")
+
+@dp.message(F.text == "💵 Narxlar")
+async def btn_prices(m: Message):
+    if not OTHER_PRICE_CATS:
+        await m.answer("Hozircha boshqa kategoriyalar yo‘q."); return
+    await m.answer("💵 Narxlar bo‘limi. Kategoriyani tanlang:", reply_markup=other_prices_kb())
+
+@dp.message(Command("lab"))
+async def cmd_lab(m: Message):
+    await m.answer("🧪 Laboratoriya bo‘limlari:", reply_markup=lab_groups_kb())
+
+@dp.message(Command("uzi"))
+async def cmd_uzi(m: Message):
+    await send_price_category_message(m, "UZI")
+
+@dp.callback_query(F.data.startswith("labcat:"))
+async def labcat_handler(q: CallbackQuery):
+    cat = q.data.split(":", 1)[1]
+    await q.message.answer(lab_category_text(cat))
+    await q.answer()
+
+@dp.callback_query(F.data.startswith("pricecat:"))
+async def pricecat_handler(q: CallbackQuery):
+    cat = q.data.split(":", 1)[1]
+    if cat == "none":
+        await q.answer(); return
+    await send_price_category_message(q.message, cat)
+    await q.answer()
+
+# === DOCTORS HANDLERS ===
+@dp.message(F.text.lower().contains("mutaxassis"))
+@dp.message(Command("doctors"))
+async def show_doctors(m: Message):
+    await m.answer("👇 Shifokorni tanlang:", reply_markup=doctors_kb())
+
+@dp.callback_query(F.data == "doc:list")
+async def cb_list(q: CallbackQuery):
+    await q.message.answer("👇 Shifokorni tanlang:", reply_markup=doctors_kb())
+    await q.answer()
+
+@dp.callback_query(F.data.startswith("doc:"))
+async def cb_doc(q: CallbackQuery):
+    doc_id = q.data.split(":", 1)[1]
+    if doc_id == "list":
+        await q.message.answer("👇 Shifokorni tanlang:", reply_markup=doctors_kb())
+        await q.answer(); return
+    d = next((x for x in DOCTORS if x["id"] == doc_id), None)
+    await q.answer()
+    if not d:
+        await q.message.answer("Shifokor topilmadi.", reply_markup=doctors_kb()); return
+    caption = doctor_caption(d)
+    photo = d.get("photo")
+    try:
+        if q.message.photo:
+            await q.message.edit_media(
+                InputMediaPhoto(media=photo, caption=caption, parse_mode=ParseMode.HTML),
+                reply_markup=back_kb()
+            )
+            return
+    except Exception:
+        pass
+    try:
+        await q.message.answer_photo(photo=photo, caption=caption, reply_markup=back_kb())
+    except Exception:
+        await q.message.answer(caption, reply_markup=back_kb())
+
+# === STANDARD BUTTON HANDLERS ===
+@dp.message(F.text.lower().contains("ish vaqti"))
+async def show_hours(m: Message):
+    await m.answer(f"🕘 <b>Ish vaqti</b>\n{esc(CLINIC['hours'])}", reply_markup=main_kb())
+
+@dp.message(F.text.lower().contains("manzil"))
+async def show_address(m: Message):
+    latitude, longitude = 40.369926, 71.268778
+    address_text = (
+        "📍 <b>Manzil:</b>\n"
+        "Farg'ona viloyati, Rishton tumani, Farovonlik MFY, "
+        "To'qimachilar ko'chasi 55A uy (Tuman prokuraturasi orqasida)\n\n"
+        "🌐 <a href='https://maps.google.com/maps?q=40.369926,71.268778&ll=40.369926,71.268778&z=16'>Google xaritada ochish</a>"
+    )
+    try:
+        await m.answer_location(latitude=latitude, longitude=longitude)
+    except Exception:
+        pass
+    await m.answer(address_text, reply_markup=main_kb(), disable_web_page_preview=False)
+
+@dp.message(F.text.lower().contains("клиник"))
+@dp.message(F.text.lower().contains("klinika haqida"))
+@dp.message(F.text.lower().contains("klinika"))
+async def show_about(m: Message):
+    photo = CLINIC.get("photo")
+    caption = (
+        "🏥 <b>Invivo Clinic</b>\n\n"
+        f"📍 <b>Manzil:</b> {esc(CLINIC['address'])}\n"
+        "🩺 <b>Faoliyat yo'nalishlari:</b> Terapiya, Pediatriya, Nevrologiya, "
+        "Stomatologiya, Ginekologiya, UZI, Fizioterapiya, Zuluk, Hijoma, Erkak va ayollar bepushtlik va inseminatsiya etish amaliyotlari.\n"
+        f"🕘 <b>Ish vaqti:</b> {esc(CLINIC['hours'])}\n"
+        "📞 <b>Aloqa uchun:</b> +998 99 302 32 31\n\n"
+        "Qo'shimcha ma'lumot uchun murojaat qiling!"
+    )
+    try:
+        await m.answer_photo(photo=photo, caption=caption, reply_markup=main_kb())
+    except Exception:
+        await m.answer(caption, reply_markup=main_kb())
+
+@dp.message(F.text == "📝 Navbatga yozilish")
+async def btn_booking(m: Message):
+    await m.answer(booking_info_text())
+    await notify_admin_booking(m, source="Reply button")
+
+@dp.message(F.text.lower().contains("narx"))
+@dp.message(F.text.lower().contains("цен"))
+async def show_prices(m: Message):
+    await m.answer("💵 <b>Narxlar bo'limi</b>\nKerakli yo'nalishni tanlang:", reply_markup=main_kb())
+    await m.answer("Kategoriya ro'yxati:", reply_markup=other_prices_kb())
+
+# === PRIVATE ROUTER ===
+@dp.message(F.chat.type == ChatType.PRIVATE)
+async def private_router(m: Message):
+    t = (m.text or "").lower()
+
+    if any(k in t for k in ["врач","доктор","специалист","mutaxassis","shifokor","doktor"]):
+        return await show_doctors(m)
+    if any(k in t for k in ["расписан","время","график","ish vaqti","ish vaqt","jadval"]):
+        return await show_hours(m)
+    if any(k in t for k in ["адрес","локац","как пройти","manzil","lokatsiya","qanday borish","qanday boraman"]):
+        return await show_address(m)
+    if any(k in t for k in ["цен","стоим","прайс","narx","narxlar","qancha","qanchaga"]):
+        return await show_prices(m)
+
+    if ("qon" in t and "tahlil" in t):
+        return await send_price_category_message(m, "Qon tahlillari")
+    if ("najas" in t and "tahlil" in t):
+        return await send_price_category_message(m, "Najas tahlillari")
+    if ("siydik" in t and "tahlil" in t):
+        return await send_price_category_message(m, "Siydik tahlillari")
+    if "biokimyo" in t:
+        return await send_price_category_message(m, "Biokimyo")
+    if "gormon" in t:
+        return await send_price_category_message(m, "Gormonlar (IHLA)")
+
+    if any(k in t for k in ["stomatolog", "stoma", "tish", "стоматолог", "зуб"]):
+        return await send_price_category_message(m, "Stomatologiya")
+    if any(k in t for k in ["ginekolog", "гинеколог", "ayol", "ayollar"]):
+        return await send_price_category_message(m, "Ginekologiya")
+    if any(k in t for k in ["uzi", "узи", "ultratovush", "ultra tovush"]):
+        return await send_price_category_message(m, "UZI")
+    if any(k in t for k in ["fgds", "egd", "endoskop", "endoskopiya", "kolonoskop", "kolonoskopiya", "колоноскопия", "фгдс"]):
+        return await send_price_category_message(m, "Endoskopiya (FGDS/Kolonoskopiya)")
+    if any(k in t for k in ["fizio", "fizioterapiya", "физиотерапия"]):
+        return await send_price_category_message(m, "Fizioterapiya")
+    if any(k in t for k in ["zuluk", "girudo", "пиявк", "гирудо"]):
+        return await send_price_category_message(m, "Zuluk terapiyasi")
+    if any(k in t for k in ["hijoma", "хиджама", "hijama"]):
+        return await send_price_category_message(m, "Hijoma")
+    if any(k in t for k in ["insemin", "inseminatsiya", "инсеминац"]):
+        return await send_price_category_message(m, "Inseminatsiya")
+
+    if any(k in t for k in ["klinika", "klinika haqida", "о клинике", "клиника"]):
+        return await show_about(m)
+    if any(k in t for k in ["navbat", "yozil", "запис", "qabul", "прием"]):
+        await m.answer(booking_info_text())
+        await notify_admin_booking(m, source="Private text")
+        return
+
+    reply = ask_llm(m.text or "", m.from_user.id)
+    await m.answer(reply, reply_markup=main_kb())
+
+# === GROUP INLINE-MENU ===
+def group_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧪 Lab analizlari", callback_data="g:lab"),
+         InlineKeyboardButton(text="🖥️ UZI",             callback_data="g:uzi")],
+        [InlineKeyboardButton(text="👨‍⚕️ Mutaxassislar", callback_data="g:doctors")],
+        [InlineKeyboardButton(text="🕘 Ish vaqti",       callback_data="g:hours"),
+         InlineKeyboardButton(text="📍 Manzil",          callback_data="g:addr")],
+        [InlineKeyboardButton(text="🏥 Klinika haqida",  callback_data="g:about"),
+         InlineKeyboardButton(text="💵 Narxlar",         callback_data="g:prices")],
+        [InlineKeyboardButton(text="ℹ️ Ma’lumot (video)", callback_data="g:info")],
+        [InlineKeyboardButton(text="📝 Navbatga yozilish", callback_data="g:book")],
+    ])
+
+@dp.callback_query(F.йata.startswith("g:"))
+async def group_menu_router(q: CallbackQuery):
+    key = q.data[2:]
+    try:
+        if key == "doctors":
+            await show_doctors(q.message)
+        elif key == "hours":
+            await show_hours(q.message)
+        elif key == "addr":
+            await show_address(q.message)
+        elif key == "about":
+            await show_about(q.message)
+        elif key == "prices":
+            await show_prices(q.message)
+        elif key == "info":
+            await show_insemination_info(q.message)
+        elif key == "book":
+            await q.message.answer(booking_info_text(), reply_markup=None)
+            await notify_admin_booking(q.message, source="Inline menu (group)")
+        elif key == "lab":
+            await q.message.answer("🧪 Laboratoriya bo‘limlari:", reply_markup=lab_groups_kb())
+        elif key == "uzi":
+            await send_price_category_message(q.message, "UZI")
+        else:
+            await q.answer("Noma'lum buyruq", show_alert=False); return
+        await q.answer()
+    except Exception as e:
+        print("GROUP MENU ERROR:", repr(e))
+        await q.answer("Xatolik", show_alert=False)
+
+# === /menu ===
+@dp.message(Command("menu"))
+async def cmd_menu(m: Message):
+    await m.answer("Bo‘limni tanlang:", reply_markup=group_menu_kb())
+
+# === "menu"/"меню" текстом в группе ===
+@dp.message((F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})) & (F.text.regexp(r"(?i)^\s*/?menu\s*$|^\s*меню\s*$")))
+async def txt_menu_group(m: Message):
+    await m.reply("Bo‘limni tanlang:", reply_markup=group_menu_kb())
+
+# === GROUP FALLBACK (ИИ) ===
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def group_fallback_ai(m: Message):
+    if m.text and m.text.startswith("/"):
+        return
+    txt_raw = (m.text or "")
+    low = txt_raw.lower()
+    keyword_triggers = [
+        "mutaxassis", "ish vaqti", "manzil",
+        "klinika haqida", "klinika",
+        "narx", "цен", "прайс",
+        "navbat", "yozil", "запис", "qabul", "прием",
+        "insemin", "hijoma", "zuluk", "fizioterapiya", "endoskop",
+        "uzi", "siydik", "najas", "qon"
+    ]
+    if any(k in low for k in keyword_triggers):
+        return
+    if not txt_raw.strip():
+        await m.reply("Assalomu alaykum! Savolingizni yozing, yordam beraman."); return
+    reply = ask_llm(txt_raw, m.from_user.id)
+    await m.reply(reply)
+
+# === MAIN ===
+async def main():
+    me = await bot.get_me()
+    print(f"[BOT] Logged in as @{me.username} (id={me.id})")
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member", "chat_member"])
+
+if __name__ == "__main__":
+    asyncio.run(main())
